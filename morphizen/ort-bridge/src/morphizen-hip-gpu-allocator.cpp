@@ -171,6 +171,69 @@ void HipGpuAllocator::DropOutgrown(size_t size, bool grown,
   }
 }
 
+// The same for the size classes, which a growing tensor walks up through
+// before it reaches the large pool. Such tensors come in sets, a KV cache
+// holding one per layer for K and for V. A driver allocation for a request (of
+// class cls, or -1 if large) while buffers are checked out in its class or
+// within two octaves below it, the set's current versions among them, is
+// taken as the set moving up; two octaves cover a multi-token append of up to
+// three times the sequence, such as each chunk of a prefill. It releases the
+// idle buffers of the class just below the request's own, which still holds
+// the set's current versions on the step it crosses into the next class, and
+// of every class in that range with nothing checked out, provided the class
+// holds at least two idle buffers and half as many as are checked out across
+// the range: the versions a set left behind, not the few buffers a transient
+// cycles through. Releases never reach upward, so re-pins cannot feed each
+// other in a cycle; what a rewound sequence left above the current one is
+// left to TrimPooled.
+void HipGpuAllocator::DropOutgrownClasses(size_t size, int cls,
+                                          std::vector<void *> &out) {
+  // [lo, hi) are the classes within two octaves below the request.
+  const size_t hi = cls >= 0 ? static_cast<size_t>(cls) : kNumSizeClasses;
+  size_t lo = hi;
+  while (lo > 0 && kSizeClasses[lo - 1] >= size / 4) {
+    --lo;
+  }
+  size_t live = cls >= 0 ? pooled_live_[hi] : 0;
+  for (size_t i = lo; i < hi; ++i) {
+    live += pooled_live_[i];
+  }
+  if (cls < 0) {
+    for (auto it = live_requested_.lower_bound(size / 4);
+         it != live_requested_.end() && it->first <= size; ++it) {
+      live += it->second;
+    }
+  }
+  if (live == 0) {
+    return;
+  }
+  const size_t min_idle = std::max<size_t>(2, (live + 1) / 2);
+  for (size_t i = lo; i < hi; ++i) {
+    if ((pooled_live_[i] == 0 || (cls >= 0 && i + 1 == hi)) &&
+        free_lists_[i].size() >= min_idle) {
+      ReleaseClass(i, out);
+    }
+  }
+}
+
+// Release the classes nothing has touched across more driver allocations than
+// this allocator holds buffers, such as those a finished or rewound sequence
+// left above where the next one stops. A class in use is touched at least
+// once per inference, which pins fewer buffers than the allocator holds, so
+// such a class does not age out; nor does anything while the pool is warm.
+void HipGpuAllocator::TrimPooled(std::vector<void *> &out) {
+  const uint64_t slack = ptr_to_size_.size();
+  if (driver_allocs_ <= slack) {
+    return;
+  }
+  const uint64_t cutoff = driver_allocs_ - slack;
+  for (size_t cls = 0; cls < kNumSizeClasses; ++cls) {
+    if (pooled_last_used_[cls] < cutoff) {
+      ReleaseClass(cls, out);
+    }
+  }
+}
+
 // Release capacities nothing is cycling through any more. An active bucket is
 // touched once per free and once per hit for every buffer in circulation, so
 // four times the peak live count is two turnarounds of slack: a cycling bucket
@@ -233,6 +296,20 @@ void HipGpuAllocator::DrainLarge(std::vector<void *> &out) {
   large_free_.clear();
 }
 
+void HipGpuAllocator::DrainPooled(std::vector<void *> &out) {
+  for (size_t cls = 0; cls < kNumSizeClasses; ++cls) {
+    ReleaseClass(cls, out);
+  }
+}
+
+void HipGpuAllocator::ReleaseClass(size_t cls, std::vector<void *> &out) {
+  for (void *ptr : free_lists_[cls]) {
+    ptr_to_size_.erase(ptr);
+    out.push_back(ptr);
+  }
+  free_lists_[cls].clear();
+}
+
 void *ORT_API_CALL HipGpuAllocator::AllocImpl(OrtAllocator *this_,
                                               size_t size) {
   if (size == 0) {
@@ -261,8 +338,12 @@ void *ORT_API_CALL HipGpuAllocator::AllocImpl(OrtAllocator *this_,
       if (!fl.empty()) {
         void *ptr = fl.back();
         fl.pop_back();
+        ++self->pooled_live_[cls];
+        self->pooled_last_used_[cls] = self->driver_allocs_;
         return ptr;
       }
+      self->DropOutgrownClasses(size, cls, stale);
+      self->TrimPooled(stale);
     } else {
       ++self->large_ops_;
       auto it = self->large_free_.lower_bound(size);
@@ -286,6 +367,8 @@ void *ORT_API_CALL HipGpuAllocator::AllocImpl(OrtAllocator *this_,
         alloc_size = LargeCapacity(size);
       }
       self->DropOutgrown(size, grown, stale);
+      self->DropOutgrownClasses(size, -1, stale);
+      self->TrimPooled(stale);
       // Here rather than in FreeImpl so that path keeps a single exit and
       // cannot drop a buffer from ptr_to_size_ without unpinning it.
       self->TrimLarge(stale);
@@ -314,13 +397,14 @@ void *ORT_API_CALL HipGpuAllocator::AllocImpl(OrtAllocator *this_,
   hipError_t err = hipHostMalloc(&ptr, alloc_size,
                                  hipHostMallocMapped | hipHostMallocCoherent);
   if (err != hipSuccess) {
-    // The large pool may be sitting on pinned pages this allocation could use,
-    // and failing while holding reclaimable memory would be worse than not
-    // pooling at all.
+    // Idle buffers, pooled or large, may be sitting on pinned pages this
+    // allocation could use, and failing while holding reclaimable memory would
+    // be worse than not pooling at all.
     std::vector<void *> drained;
     {
       std::lock_guard<std::mutex> lk(self->pool_mutex_);
       self->DrainLarge(drained);
+      self->DrainPooled(drained);
     }
     if (!drained.empty()) {
       ReleaseToDriver(drained, self->device_id_);
@@ -337,8 +421,11 @@ void *ORT_API_CALL HipGpuAllocator::AllocImpl(OrtAllocator *this_,
   {
     std::lock_guard<std::mutex> lk(self->pool_mutex_);
     self->ptr_to_size_[ptr] = alloc_size;
+    ++self->driver_allocs_;
     if (cls < 0) {
       self->NoteLargeCheckedOut(ptr, size, grown);
+    } else {
+      ++self->pooled_live_[cls];
     }
   }
   return ptr;
@@ -360,9 +447,11 @@ void ORT_API_CALL HipGpuAllocator::FreeImpl(OrtAllocator *this_, void *p) {
     } else if (const int cls = SizeClassIndex(it->second); cls >= 0) {
       // Pooled small/medium buffer (<= 16 MB): return to its free list for
       // reuse; do NOT release to the driver here. Stays tracked in
-      // ptr_to_size_ so the destructor can release it. Safe to reuse without
-      // a stream sync: see the pool comment in the header.
+      // ptr_to_size_ until AllocImpl or the destructor releases it. Safe to
+      // reuse without a stream sync: see the pool comment in the header.
       self->free_lists_[cls].push_back(p);
+      --self->pooled_live_[cls];
+      self->pooled_last_used_[cls] = self->driver_allocs_;
     } else {
       const size_t capacity = it->second;
       ++self->large_ops_;
