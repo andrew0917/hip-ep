@@ -121,11 +121,15 @@ private:
   static const OrtMemoryInfo *ORT_API_CALL InfoImpl(const OrtAllocator *this_);
   static void *ORT_API_CALL ReserveImpl(OrtAllocator *this_, size_t size);
 
-  // All six expect pool_mutex_ held. The first three append buffers the
+  // All ten expect pool_mutex_ held. The first seven append buffers the
   // caller must hand to the driver after releasing it.
   void DropOutgrown(size_t size, bool grown, std::vector<void *> &out);
+  void DropOutgrownClasses(size_t size, int cls, std::vector<void *> &out);
+  void TrimPooled(std::vector<void *> &out);
   void TrimLarge(std::vector<void *> &out);
   void DrainLarge(std::vector<void *> &out);
+  void DrainPooled(std::vector<void *> &out);
+  void ReleaseClass(size_t cls, std::vector<void *> &out);
   void NoteLargeCheckedOut(void *ptr, size_t requested, bool grown);
   bool ReplacesLiveBuffer(size_t size) const;
   bool ReplacedByLiveBuffer(size_t requested) const;
@@ -142,9 +146,17 @@ private:
   // mapping to the same class reuses it (100% hit rate after warmup, with at
   // most a few distinct class sizes regardless of how many dynamic shapes the
   // model sees). Pooled (<= 16 MB) buffers are never returned to the driver in
-  // Free; they are released wholesale in the destructor — matching the
-  // project's per-session "grow-on-demand, never shrink, free at cleanup"
-  // memory contract.
+  // Free.
+  //
+  // A tensor that is re-created a little longer on every inference (see
+  // below) does not stay in one class, though. It moves up a class every few
+  // steps, and the class it leaves keeps its last two versions until a new
+  // sequence regrows through it. A 4 KB/token KV tensor passes through over a
+  // hundred classes on its way to 16 MB, so keeping them all would pin some 80
+  // times its size. DropOutgrownClasses therefore releases the classes such
+  // tensors have moved up from whenever their next versions need a driver
+  // allocation, and TrimPooled the classes nothing has asked for in a long
+  // while, such as those a finished or rewound sequence left behind.
   //
   // Requests above 16 MB bypass the classes: each is allocated at exactly its
   // size and returned to the driver on Free. The exception is a tensor that is
@@ -172,7 +184,7 @@ private:
   // so retention is tied to the tensors rather than to the allocator's
   // lifetime. TrimLarge additionally ages out capacities that stop being asked
   // for while others are still cycling, and a driver allocation failure
-  // drains the pool and retries.
+  // drains every idle buffer, pooled or large, and retries.
   //
   // Reuse needs no per-handout stream sync: ORT only calls Free after Run
   // returns, and allocator-mode inference_compute ends with a full
@@ -181,11 +193,19 @@ private:
   std::mutex pool_mutex_;
   // Index i holds reusable buffers each exactly kSizeClasses[i] bytes.
   std::array<std::vector<void *>, kNumSizeClasses> free_lists_;
+  // Index i counts the checked-out buffers of kSizeClasses[i] bytes.
+  std::array<size_t, kNumSizeClasses> pooled_live_{};
+  // driver_allocs_ at the last hit or free in each class; read as an age by
+  // TrimPooled.
+  std::array<uint64_t, kNumSizeClasses> pooled_last_used_{};
+  // Ticked on every driver allocation, so classes only age while memory is
+  // being pinned: a warm pool never trims.
+  uint64_t driver_allocs_ = 0;
   // Every pointer hipHostMalloc'd by this allocator that is still outstanding
   // -> its allocated byte size (the rounded-up class capacity for pooled
-  // buffers, the exact size for large ones). Pooled buffers stay tracked for
-  // the allocator's lifetime (Free only moves them onto a free list) so the
-  // destructor can release them; a large buffer is erased from this map in
+  // buffers, the exact size for large ones). Free only moves a pooled buffer
+  // onto a free list, so it stays tracked until AllocImpl releases its class
+  // or the destructor runs; a large buffer is erased from this map in
   // FreeImpl when it is freed back to the driver.
   std::unordered_map<void *, size_t> ptr_to_size_;
 
