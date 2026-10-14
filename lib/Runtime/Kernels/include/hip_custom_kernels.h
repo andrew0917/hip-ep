@@ -1029,11 +1029,11 @@ HIP_KERNEL_API int hip_gqa_kv_cache_append(
  * INT8 quant of the new fp16 tokens, past then read as INT8, scale = [G,d]).
  * s_lo: first present position to write. Positions [0, s_lo) are LEFT UNWRITTEN
  * -- not zeroed, not copied -- so present is only valid from s_lo onwards, and
- * the caller must not read below it. Pass 0 for a full concat. The grid shrinks
- * with s_lo, which is the point: a sliding-window layer at decode passes the
- * same lower bound it reads from, so the bytes it skips writing are exactly the
- * bytes it will not read. Clamped internally to [0, past_len] so the new tokens
- * at [past_len, past_len+sq) are always written. */
+ * nothing may read below it. Pass 0 for a full concat. The EP always does, even
+ * for a sliding-window layer: present is a graph output, and the host may copy
+ * any prefix of it into a later past (onnxruntime-genai's RewindTo does).
+ * Clamped internally to [0, past_len] so the new tokens at
+ * [past_len, past_len+sq) are always written. */
 HIP_KERNEL_API int hip_gqa_kv_cache_concat(
     void* stream, const void* past, const void* current, void* present,
     int batch_size, int past_len, int sq, int G, int d,
