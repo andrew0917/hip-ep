@@ -416,8 +416,8 @@ int hipdnn_ep_tensor_prepare_input(RuntimeState *state, span_t *inputs,
   // Fast path: caller already placed `data` in GPU-accessible memory
   // (TENSOR_MEMORY_GPU), so we alias the buffer instead of pool_alloc + H2D.
   // This is the path that eliminates the per-decode 2 GB KV-cache H2D copy
-  // when OGA's MorphiZenEP device interface allocated KV cache via our
-  // hipHostMalloc(Mapped|Coherent) allocator (path A). The caller still owns
+  // when OGA allocated the KV cache through the EP's DEFAULT (device-local)
+  // allocator (path A). The caller still owns
   // the buffer; finalize_output / free_input must skip pool_release in
   // this case (gated by TensorBuffer.is_aliased).
   //
@@ -572,9 +572,9 @@ int hipdnn_ep_tensor_finalize_output(RuntimeState *state,
   }
 
   // D2H transfer (async -- sync happens once after all outputs).
-  // Skipped on the alias fast path: gpu_ptr already points into the caller's
-  // GPU-accessible host_ptr (same physical pages on AMD APU mapped pinned
-  // memory), so the kernel has already written the result; no copy needed.
+  // Skipped on the alias fast path: gpu_ptr is the caller's GPU-accessible
+  // buffer itself, so the kernel has already written the result; no copy
+  // needed.
   if (!buffer->is_aliased) {
     if (hipMemcpyAsync(buffer->host_ptr, buffer->gpu_ptr, buffer->size_bytes,
                        hipMemcpyDeviceToHost,

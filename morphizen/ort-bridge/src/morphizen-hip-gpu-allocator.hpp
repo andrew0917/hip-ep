@@ -97,11 +97,11 @@ inline constexpr SizeClassTable kSizeClassTable = BuildSizeClasses();
 inline constexpr const size_t *kSizeClasses = detail::kSizeClassTable.data;
 inline constexpr size_t kNumSizeClasses = detail::kSizeClassTable.count;
 
-// hipHostMalloc(Mapped|Coherent) backed OrtAllocator. One instance is created
-// per OrtMemoryInfo registered with OrtEpDevice (typically one DEFAULT GPU
-// info and one HOST_ACCESSIBLE info — both currently route to the same
-// mapped pinned allocator, since AMD APU iGPU shares physical memory with
-// the host). ORT keeps the allocator alive for the matching session.
+// HIP runtime backed OrtAllocator. One instance is created per OrtMemoryInfo
+// registered with OrtEpDevice: the DEFAULT GPU info allocates device-local
+// memory with hipMalloc, and the HOST_ACCESSIBLE info allocates
+// hipHostMalloc(Mapped|Coherent) memory that the host may dereference. ORT
+// keeps the allocator alive for the matching session.
 struct HipGpuAllocator : OrtAllocator {
   // memory_info ownership stays with the factory. The OrtMemoryInfo's
   // device_id (extracted via OrtApi::MemoryInfoGetId at construction time)
@@ -110,7 +110,7 @@ struct HipGpuAllocator : OrtAllocator {
   // GPU that the OrtEpDevice actually represents (instead of always hitting
   // device 0).
   HipGpuAllocator(const OrtMemoryInfo *memory_info, const OrtApi &api);
-  // Frees every pinned buffer this allocator ever handed out (both the
+  // Frees every buffer this allocator ever handed out (both the
   // currently-free pool entries and any still checked out). Called by the
   // factory's ReleaseAllocator at session teardown.
   ~HipGpuAllocator();
@@ -134,11 +134,12 @@ private:
   bool ReplacesLiveBuffer(size_t size) const;
   bool ReplacedByLiveBuffer(size_t requested) const;
 
-  // Fixed size-class caching allocator. hipHostMalloc is a heavyweight
-  // (page-pinning) call: ORT re-allocates the per-Run input device-copy
-  // buffers and (allocator mode) the graph-output buffers on EVERY inference,
-  // so without caching the EP pays dozens of hipHostMalloc + hipHostFree per
-  // Compute (the dominant non-compute cost on small fixed-shape graphs).
+  // Fixed size-class caching allocator. Driver allocations are heavyweight
+  // (hipHostMalloc pins pages; hipMalloc costs tens of microseconds on
+  // Windows): ORT re-allocates the per-Run input device-copy buffers and
+  // (allocator mode) the graph-output buffers on EVERY inference, so without
+  // caching the EP pays dozens of driver allocations and frees per Compute
+  // (the dominant non-compute cost on small fixed-shape graphs).
   //
   // A request is rounded up to one of kSizeClasses and served from that
   // class's free list; the buffer is allocated at the full class capacity, so
@@ -162,7 +163,7 @@ private:
   // size and returned to the driver on Free. The exception is a tensor that is
   // re-created a little longer on every inference, such as a KV cache run with
   // past_present_share_buffer=false, where no two steps ask for the same size
-  // and every step would page-pin a fresh buffer. A request slightly larger
+  // and every step would allocate a fresh buffer. A request slightly larger
   // than a buffer still checked out is taken as that pattern and allocated
   // with growth headroom. Only such buffers, and the buffers they replaced,
   // are kept on Free, keyed by capacity, and a request takes the smallest one
@@ -173,7 +174,7 @@ private:
   // The first version of a growing tensor, such as the KV cache a new
   // generator prefills, has nothing to grow from. Allocated exactly, it could
   // not serve the step after its successor replaces it, and that step would
-  // page-pin a second set. Once a grown buffer has been reused, every large
+  // allocate a second set. Once a grown buffer has been reused, every large
   // request is therefore allocated with the headroom, including those of
   // tensors that keep their size.
   //
@@ -199,9 +200,9 @@ private:
   // TrimPooled.
   std::array<uint64_t, kNumSizeClasses> pooled_last_used_{};
   // Ticked on every driver allocation, so classes only age while memory is
-  // being pinned: a warm pool never trims.
+  // being allocated: a warm pool never trims.
   uint64_t driver_allocs_ = 0;
-  // Every pointer hipHostMalloc'd by this allocator that is still outstanding
+  // Every pointer this allocator got from the driver that is still outstanding
   // -> its allocated byte size (the rounded-up class capacity for pooled
   // buffers, the exact size for large ones). Free only moves a pooled buffer
   // onto a free list, so it stays tracked until AllocImpl releases its class
@@ -245,6 +246,10 @@ private:
   // (e.g. degenerate / fake OrtMemoryInfo); AllocImpl falls back to the
   // current HIP device in that case rather than failing the allocation.
   int device_id_;
+  // Fixed at construction: true for the DEFAULT memory info, whose buffers
+  // come from hipMalloc; false for HOST_ACCESSIBLE, whose buffers come from
+  // hipHostMalloc(Mapped|Coherent). Selects the matching free call too.
+  bool device_local_;
 };
 
 // hipMemcpy / hipMemcpyAsync based OrtDataTransferImpl. A single shared

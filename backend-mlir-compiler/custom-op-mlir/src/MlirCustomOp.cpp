@@ -637,9 +637,9 @@ void *output_allocate_cb(void *self, int64_t out_idx, const int64_t *shape,
     octx->allocated[static_cast<size_t>(out_idx)] = true;
 
     if (mem_type == TENSOR_MEMORY_GPU) {
-      // Zero-copy: ORT buffer is already GPU-accessible (e.g. the EP's
-      // host-mapped allocator, or caller-provided device memory). The DLL
-      // writes into it directly.
+      // Zero-copy: ORT buffer is already GPU-accessible (e.g. the EP's own
+      // allocator, or caller-provided device memory). The DLL writes into it
+      // directly.
       return ort_ptr;
     }
 

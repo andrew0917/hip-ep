@@ -24,6 +24,7 @@
 #include <onnxruntime_cxx_api.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -106,17 +107,29 @@ static_assert(LargeCapacity(64ull << 20) - (64ull << 20) >= 512 * 4096,
               "one capacity must span 512 tokens of a KV tensor that is "
               "64 MiB at a 16 K context");
 
-// Hand a batch of buffers back to the driver with pool_mutex_ released:
-// hipHostFree unpins pages and is as heavyweight as the hipHostMalloc that
-// pinned them, so holding the lock would serialize every other allocation
+hipError_t DriverAlloc(void **ptr, size_t size, bool device_local) {
+  if (device_local) {
+    return hipMalloc(ptr, size);
+  }
+  return hipHostMalloc(ptr, size, hipHostMallocMapped | hipHostMallocCoherent);
+}
+
+hipError_t DriverFree(void *ptr, bool device_local) {
+  return device_local ? hipFree(ptr) : hipHostFree(ptr);
+}
+
+// Hand a batch of buffers back to the driver with pool_mutex_ released: a
+// driver free is as heavyweight as the allocation it undoes (hipHostFree
+// unpins pages), so holding the lock would serialize every other allocation
 // behind it.
-void ReleaseToDriver(const std::vector<void *> &buffers, int device_id) {
+void ReleaseToDriver(const std::vector<void *> &buffers, int device_id,
+                     bool device_local) {
   if (buffers.empty()) {
     return;
   }
   ScopedDevice _(device_id);
   for (void *p : buffers) {
-    (void)hipHostFree(p);
+    (void)DriverFree(p, device_local);
   }
 }
 
@@ -137,13 +150,40 @@ int TryGetDeviceId(const OrtMemoryInfo *memory_info) noexcept {
   }
 }
 
+// DEFAULT memory must never be dereferenced on the host: ORT reaches it
+// through HipDataTransferImpl, and OGA's AMDGPU device interface treats it as
+// an opaque device handle copied with CopyTensors. That lets it be
+// device-local, which on an APU keeps it out of the host-visible GPU memory
+// budget (on Windows, half of the RAM the OS sees), which can be far smaller
+// than the GPU's dedicated carve-out. The KV cache is DEFAULT memory, and with
+// past_present_share_buffer=false it holds past and present at once, so a
+// host-mapped KV cache bounds the context length by that budget.
+//
+// HOST_ACCESSIBLE memory stays host-mapped: OGA writes its decode inputs in
+// place through a pointer it aliases for host and device.
+//
+// HIPDNN_EP_DEFAULT_MEMORY_DEVICE_LOCAL=0 maps DEFAULT memory too, for a host
+// application that dereferences DEFAULT tensors directly.
+bool IsDeviceLocal(const OrtMemoryInfo *memory_info,
+                   const OrtApi &api) noexcept {
+  static const bool default_device_local = [] {
+    const char *v = std::getenv("HIPDNN_EP_DEFAULT_MEMORY_DEVICE_LOCAL");
+    // Default on; explicit "0" disables.
+    return !v || std::strcmp(v, "0") != 0;
+  }();
+  return default_device_local && memory_info != nullptr &&
+         api.MemoryInfoGetDeviceMemType(memory_info) ==
+             OrtDeviceMemoryType_DEFAULT;
+}
+
 } // namespace
 
 // =============== HipGpuAllocator ===============
 
 HipGpuAllocator::HipGpuAllocator(const OrtMemoryInfo *memory_info,
-                                 const OrtApi & /*api*/)
-    : memory_info_{memory_info}, device_id_{TryGetDeviceId(memory_info)} {
+                                 const OrtApi &api)
+    : memory_info_{memory_info}, device_id_{TryGetDeviceId(memory_info)},
+      device_local_{IsDeviceLocal(memory_info, api)} {
   version = NegotiatedOrtApiVersion();
   Alloc = AllocImpl;
   Free = FreeImpl;
@@ -370,36 +410,20 @@ void *ORT_API_CALL HipGpuAllocator::AllocImpl(OrtAllocator *this_,
       self->DropOutgrownClasses(size, -1, stale);
       self->TrimPooled(stale);
       // Here rather than in FreeImpl so that path keeps a single exit and
-      // cannot drop a buffer from ptr_to_size_ without unpinning it.
+      // cannot drop a buffer from ptr_to_size_ without releasing it.
       self->TrimLarge(stale);
     }
   }
-  ReleaseToDriver(stale, self->device_id_);
+  ReleaseToDriver(stale, self->device_id_, self->device_local_);
 
   ScopedDevice _(self->device_id_);
 
-  // On AMD APU iGPU (the only hardware MorphiZen EP currently targets) the
-  // GPU shares physical memory with the CPU, so we use hipHostMalloc(Mapped)
-  // for both DEFAULT and HOST_ACCESSIBLE OrtMemoryInfos: the same pointer is
-  // dereferenceable from CPU and GPU. (hipMalloc would return a GPU-only
-  // virtual address that the host cannot deref, which crashes OGA's KV
-  // cache zero-init.)
-  //
-  // TODO(discrete-gpu): on a discrete AMD GPU (PCIe), DEFAULT memory should
-  // be hipMalloc'd into VRAM for locality + to avoid the host coherency
-  // traffic. HOST_ACCESSIBLE should keep using hipHostMalloc(Mapped). To
-  // do that we need to (a) read OrtMemoryInfoGetMemType from memory_info_
-  // and branch here, and (b) update OGA's MorphiZenEP::Memory struct to
-  // stop aliasing p_cpu_ = p_device_ and instead route Zero / CopyDeviceToCpu
-  // / CopyCpuToDevice through the HIP runtime. Tracked separately because
-  // the OGA-side change cuts across the smartptrs / DeviceBuffer abstraction.
   void *ptr = nullptr;
-  hipError_t err = hipHostMalloc(&ptr, alloc_size,
-                                 hipHostMallocMapped | hipHostMallocCoherent);
+  hipError_t err = DriverAlloc(&ptr, alloc_size, self->device_local_);
   if (err != hipSuccess) {
-    // Idle buffers, pooled or large, may be sitting on pinned pages this
-    // allocation could use, and failing while holding reclaimable memory would
-    // be worse than not pooling at all.
+    // Idle buffers, pooled or large, may be sitting on memory this allocation
+    // could use, and failing while holding reclaimable memory would be worse
+    // than not pooling at all.
     std::vector<void *> drained;
     {
       std::lock_guard<std::mutex> lk(self->pool_mutex_);
@@ -407,15 +431,16 @@ void *ORT_API_CALL HipGpuAllocator::AllocImpl(OrtAllocator *this_,
       self->DrainPooled(drained);
     }
     if (!drained.empty()) {
-      ReleaseToDriver(drained, self->device_id_);
-      err = hipHostMalloc(&ptr, alloc_size,
-                          hipHostMallocMapped | hipHostMallocCoherent);
+      ReleaseToDriver(drained, self->device_id_, self->device_local_);
+      err = DriverAlloc(&ptr, alloc_size, self->device_local_);
     }
   }
   if (err != hipSuccess) {
-    LOG(ERROR) << "[MorphiZen HIP] hipHostMalloc(Mapped|Coherent) failed for "
-               << alloc_size << " bytes (device " << self->device_id_
-               << "): " << hipGetErrorString(err);
+    LOG(ERROR) << "[MorphiZen HIP] "
+               << (self->device_local_ ? "hipMalloc"
+                                       : "hipHostMalloc(Mapped|Coherent)")
+               << " failed for " << alloc_size << " bytes (device "
+               << self->device_id_ << "): " << hipGetErrorString(err);
     return nullptr;
   }
   {
@@ -487,21 +512,23 @@ void ORT_API_CALL HipGpuAllocator::FreeImpl(OrtAllocator *this_, void *p) {
       }
     }
   }
-  ReleaseToDriver(to_release, self->device_id_);
+  ReleaseToDriver(to_release, self->device_id_, self->device_local_);
 }
 
 HipGpuAllocator::~HipGpuAllocator() {
-  // Release every pinned buffer the pool ever allocated. By teardown ORT has
-  // freed all outstanding tensors (they are back on free_lists_), but we walk
+  // Release every buffer the pool ever allocated. By teardown ORT has freed
+  // all outstanding tensors (they are back on free_lists_), but we walk
   // ptr_to_size_ rather than free_lists_ so any still-checked-out buffer is
   // also released instead of leaked.
   ScopedDevice _(device_id_);
   std::lock_guard<std::mutex> lk(pool_mutex_);
   for (const auto &kv : ptr_to_size_) {
-    hipError_t err = hipHostFree(kv.first);
+    hipError_t err = DriverFree(kv.first, device_local_);
     if (err != hipSuccess) {
-      LOG(WARNING) << "[MorphiZen HIP] hipHostFree failed (device "
-                   << device_id_ << "): " << hipGetErrorString(err);
+      LOG(WARNING) << "[MorphiZen HIP] "
+                   << (device_local_ ? "hipFree" : "hipHostFree")
+                   << " failed (device " << device_id_
+                   << "): " << hipGetErrorString(err);
     }
   }
   for (auto &fl : free_lists_) {
